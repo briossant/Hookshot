@@ -51,6 +51,8 @@
 #include "vk_work.h"   // (after the others: counts the commands that do GPU work, for full_barrier)
 
 namespace mkwvk {
+bool trace_on();                    // (vk_draw.cpp; RX_VK_TRACE_FRAMES: submits, event signals and waits there too)
+void trace_text(const char* text);
 extern std::atomic<bool> movie_networks_slow;   // (vk_draw.cpp: the movie networks left out, issue 109)
 int64_t presents_now;   // (the presents so far, for SlowWatch)
 void hang_watch_start();   // (EvilOOT, vk_hangdump.cpp: RX_VK_HANG_DUMP)
@@ -711,6 +713,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
                 uint32_t old = it != ev_values.end() ? it->second : 0;
                 if (it == ev_values.end()) host->gpu_read(e.gpu, &old, 4);
                 ev_values[e.gpu] = e.mode == NVN_EVENT_SIGNAL_MODE_ADD ? old + e.value : e.value;
+                if (trace_on()) {
+                    char t[128];
+                    snprintf(t, sizeof t, "signal ev@%llx %s %u -> %u", (unsigned long long)e.gpu,
+                             e.mode == NVN_EVENT_SIGNAL_MODE_ADD ? "add" : "set", e.value, ev_values[e.gpu]);
+                    trace_text(t);
+                }
             }
             if (dry) break;
             const auto e = payload<nvn_p_signal>(a, avail);
@@ -731,6 +739,12 @@ void replay(VkCommandBuffer& cmd, NvnState& s, const uint8_t* p, const uint8_t* 
             const auto w = payload<nvn_p_wait_event>(a, avail);
             ev_cpu_apply();
             const uint32_t have = event_value_in(ev_values, w.gpu);
+            if (trace_on()) {
+                char t[128];
+                snprintf(t, sizeof t, "wait ev@%llx %s %u has %u: %s", (unsigned long long)w.gpu, w.mode == 0 ? "==" : ">=", w.value,
+                         have, event_wait_met(have, w.mode, w.value) ? "met" : suspend_ok ? "STOP" : "UNMET");
+                trace_text(t);
+            }
             if (event_wait_met(have, w.mode, w.value)) {
                 st_waits_met++;
             } else if (suspend_ok) {   // (on once that work is replayed; a dry pass: its part up to here)
@@ -1886,6 +1900,12 @@ bool run_submit(const uint64_t* handles, int n, uint64_t value, uint64_t queue, 
     }
     VkCommandBuffer cmd = rec_cur->cmd;
     const uint8_t* stop = nullptr;
+    if (trace_on()) {
+        char t[128];
+        snprintf(t, sizeof t, "submit q%llx v%llu cb%d/%d%s", (unsigned long long)queue, (unsigned long long)value, cb, n,
+                 p ? " (resumed)" : "");
+        trace_text(t);
+    }
     for (; cb < n; cb++, p = nullptr) {
         if (!handles[cb]) continue;
         stop = replay_handle(cmd, p ? p : reinterpret_cast<const uint8_t*>(handles[cb]), may_stop);
@@ -1978,6 +1998,18 @@ void drain(int why) {
         for (const auto& [queue, q] : qruns)
             if (q.blocked() && q.oldest() < best) best = q.oldest(), bq = queue;
         if (best == UINT64_MAX) break;
+        {   // (RX_VK_LOG_FORCED=1: each wait gone past, with the event it was not met for: what read work not made yet)
+            static const bool log_forced = getenv("RX_VK_LOG_FORCED") != nullptr;
+            const QueueRun& q = qruns[bq];
+            if (log_forced && q.waiting) {
+                const nvn_p_wait_event w = wait_at(q.p);
+                logf("vk: forced past a wait: frame %llu, why %d, queue %#llx, submission %llu, command buffer %d, event %#llx %s %u "
+                     "(has %u), stopped %.2f ms", (unsigned long long)texture_frame_no(), why, (unsigned long long)bq,
+                     (unsigned long long)q.value, q.cb, (unsigned long long)w.gpu, w.mode == 0 ? "==" : ">=", w.value,
+                     event_value_in(ev_values, w.gpu),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - blocked_since).count());
+            }
+        }
         resume_queue(bq, qruns[bq].waiting);
     }
     burst_end();
@@ -2613,6 +2645,8 @@ bool write_png(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h) {
     }
 }
 
+void probe_dump_all(const char* why);   // (vk_draw.cpp; RX_VK_PROBE_DUMP_AT below)
+
 namespace {
 
 int64_t fps_n = 0;
@@ -2928,6 +2962,24 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         }
         ts_anchor_ns = host->ticks() * 32;
         dump_present(presents);
+        {   // (hookshot) RX_VK_PROBE_DUMP_AT=<texture frame>,... (a diagnosis, with RX_VK_PROBE=2): the probe's last 16 frames written there,
+            // probe_all_<n>.txt beside the game: each pass's centre texel and each draw's uniform and storage buffers, a flicker's
+            // frames side by side, whatever the picture looks like
+            static const std::vector<uint64_t> at = [] {
+                std::vector<uint64_t> v;
+                if (const char* e = getenv("RX_VK_PROBE_DUMP_AT"))
+                    for (const char* q = e; *q;) {
+                        char* end;
+                        const uint64_t f = strtoull(q, &end, 10);
+                        if (end == q) break;
+                        v.push_back(f);
+                        q = *end ? end + 1 : end;
+                    }
+                return v;
+            }();
+            if (!at.empty() && std::find(at.begin(), at.end(), texture_frame_no()) != at.end())
+                probe_dump_all("asked (RX_VK_PROBE_DUMP_AT)");
+        }
         if (src && (dev.offscreen || shots) && offscreen_init()) {
             if (dev.offscreen) {
                 image_barrier(r.cmd, off_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);

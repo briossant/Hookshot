@@ -3429,6 +3429,8 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
+    static const bool always = getenv("RX_VK_DYN_ALWAYS") != nullptr;   // (a test: every dynamic state set again for each draw)
+    if (always) last_dyn_valid = false;
     if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
         pass().wm_or |= dyn_fast.wm0, pass().wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
@@ -3968,6 +3970,13 @@ void* probe_map = nullptr;
 ProbeEntry probe_meta[kProbeFrames][kProbePerFrame];
 uint32_t probe_n[kProbeFrames];
 uint64_t probe_frame[kProbeFrames];
+constexpr uint32_t kProbeFullPerFrame = 4, kProbeFullBytes = 1u << 20;   // (RX_VK_PROBE_FULL: whole images)
+VkBuffer probe_full_buf = VK_NULL_HANDLE;
+VmaAllocation probe_full_mem = nullptr;
+void* probe_full_map = nullptr;
+ProbeEntry probe_full_meta[kProbeFrames][kProbeFullPerFrame];   // (draws: the probe entry's index)
+uint32_t probe_full_n[kProbeFrames];
+uint64_t probe_full_frame[kProbeFrames];
 } // namespace
 bool probe_on() {
     static const bool on = getenv("RX_VK_PROBE") != nullptr;
@@ -3982,8 +3991,11 @@ bool probe_lite() {
 bool probe_serial() { return probe_on() && !probe_lite(); }
 std::mutex probe_mu;
 void probe_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t layer, uint64_t prog, char kind, int draws = -1) {
+    // (RX_VK_PROBE_DEPTH=1: the passes' depth targets too, their depth word: a block of draws that left no mark, its test)
+    static const bool depth_too = getenv("RX_VK_PROBE_DEPTH") != nullptr;
+    const bool is_depth = tex && !(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && (tex->aspect & VK_IMAGE_ASPECT_DEPTH_BIT);
     if (!probe_on() || !tex || !tex->image || tex->samples != VK_SAMPLE_COUNT_1_BIT || tex->astc || tex->bc ||
-        !(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT))
+        (!(tex->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && !(depth_too && is_depth)))
         return;
     {   // (RX_VK_PROBE_MIN=<pixels>: smaller images too, the ambient cubemap's for one)
         static const uint32_t min_w = getenv("RX_VK_PROBE_MIN") ? (uint32_t)atoi(getenv("RX_VK_PROBE_MIN")) : 384;
@@ -4004,10 +4016,51 @@ void probe_image(VkCommandBuffer cmd, Texture* tex, uint32_t level, uint32_t lay
     probe_meta[slot][i] = {prog, tex->gpu, (uint32_t)tex->format, w, h, kind, draws};
     std::memset((uint8_t*)probe_map + (uint64_t{slot} * kProbePerFrame + i) * 16, 0, 16);
     full_barrier(cmd);
+    // (RX_VK_PROBE_AT=<x>,<y>: the texel there, as fractions of the image, not the centre: where a defect is)
+    static const std::pair<double, double> at = [] {
+        double x = 0.5, y = 0.5;
+        if (const char* e = getenv("RX_VK_PROBE_AT")) sscanf(e, "%lf,%lf", &x, &y);
+        return std::pair<double, double>{std::clamp(x, 0.0, 1.0), std::clamp(y, 0.0, 1.0)};
+    }();
     const VkBufferImageCopy c{(uint64_t{slot} * kProbePerFrame + i) * 16, 0, 0,
-                              {VK_IMAGE_ASPECT_COLOR_BIT, level, std::min(layer, tex->layers - 1), 1},
-                              {(int32_t)(w / 2), (int32_t)(h / 2), 0}, {1, 1, 1}};
+                              {(VkImageAspectFlags)(is_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), level,
+                               std::min(layer, tex->layers - 1), 1},
+                              {(int32_t)std::min<double>(w - 1, at.first * w), (int32_t)std::min<double>(h - 1, at.second * h), 0}, {1, 1, 1}};
     vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, probe_buf, 1, &c);
+    // (RX_VK_PROBE_FULL=<program key prefix>,...: those programs' images whole too, 4 a frame and 1 MB each at most, written
+    // beside the game with the probe's dump (probe_full_*.bin): where in the picture a value went wrong)
+    static const std::vector<std::string> full_progs = [] {
+        std::vector<std::string> v;
+        if (const char* e = getenv("RX_VK_PROBE_FULL"))
+            for (const char* q = e; *q;) {
+                const char* d = strchr(q, ',');
+                const size_t len = d ? (size_t)(d - q) : strlen(q);
+                if (len) v.emplace_back(q, len);
+                q = d ? d + 1 : q + len;
+            }
+        return v;
+    }();
+    if (!full_progs.empty()) {
+        char hex[24];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)prog);
+        bool hit = false;
+        for (const std::string& f : full_progs) hit |= !strncmp(hex, f.c_str(), f.size());
+        const uint32_t bpt = tex->format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 || tex->format == VK_FORMAT_R32_SFLOAT ? 4
+                             : tex->format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 0;
+        if (hit && bpt && !is_depth && (uint64_t)w * h * bpt <= kProbeFullBytes) {
+            if (!probe_full_buf && !create_buffer(uint64_t{kProbeFrames} * kProbeFullPerFrame * kProbeFullBytes,
+                                                  VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, probe_full_buf, probe_full_mem, &probe_full_map))
+                probe_full_buf = VK_NULL_HANDLE;
+            if (probe_full_frame[slot] != f) probe_full_frame[slot] = f, probe_full_n[slot] = 0;
+            if (probe_full_buf && probe_full_n[slot] < kProbeFullPerFrame) {
+                const uint32_t j = probe_full_n[slot]++;
+                probe_full_meta[slot][j] = {prog, tex->gpu, (uint32_t)tex->format, w, h, kind, (int)i};
+                const VkBufferImageCopy all{(uint64_t{slot} * kProbeFullPerFrame + j) * kProbeFullBytes, 0, 0,
+                                            {VK_IMAGE_ASPECT_COLOR_BIT, level, std::min(layer, tex->layers - 1), 1}, {0, 0, 0}, {w, h, 1}};
+                vkCmdCopyImageToBuffer(cmd, tex->image, VK_IMAGE_LAYOUT_GENERAL, probe_full_buf, 1, &all);
+            }
+        }
+    }
     full_barrier(cmd);
 }
 // (the uniform buffers of each pass's first draw: non-finite floats, a global constant gone wrong)
@@ -4123,6 +4176,26 @@ void probe_dump_all(const char* why) {
             for (const std::string& l : probe_ubos[slot]) fprintf(o, "%s\n", l.c_str());
         fclose(o);
     }
+    if (probe_full_map) {   // (the whole images: a header of 8 words (frame, entry, program, address, w, h, format), then the texels)
+        const uint64_t now = texture_frame_no();
+        char fp[64];
+        snprintf(fp, sizeof fp, "probe_full_%d.bin", n - 1);
+        if (FILE* o = fopen(fp, "wb")) {
+            for (uint64_t f = now >= 15 ? now - 15 : 0; f <= now; f++) {
+                const uint32_t slot = (uint32_t)(f % kProbeFrames);
+                if (probe_full_frame[slot] != f) continue;
+                for (uint32_t j = 0; j < probe_full_n[slot]; j++) {
+                    const ProbeEntry& e = probe_full_meta[slot][j];
+                    const uint32_t bpt = e.fmt == (uint32_t)VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
+                    const uint64_t hdr[8] = {f, (uint64_t)e.draws, e.prog, e.gpu, e.w, e.h, e.fmt, (uint64_t)bpt};
+                    fwrite(hdr, sizeof hdr, 1, o);
+                    fwrite((uint8_t*)probe_full_map + (uint64_t{slot} * kProbeFullPerFrame + j) * kProbeFullBytes, 1,
+                           (size_t)e.w * e.h * bpt, o);
+                }
+            }
+            fclose(o);
+        }
+    }
 }
 void probe_log(uint64_t f) {
     if (!probe_on() || !probe_map) return;
@@ -4175,9 +4248,12 @@ void end_pass(VkCommandBuffer cmd) {
         }
         dump_mesh_indirect().clear();
     }
-    if (probe_on())
+    if (probe_on()) {
         for (int i = 0; i < pass().n; i++)
             if (pass().color[i] && pass().tex[i]) probe_image(cmd, pass().tex[i], pass().level[i], pass().layer[i], pass().prog, 'p', pass().draws);
+        if (pass().depth && pass().depth_tex)   // (RX_VK_PROBE_DEPTH)
+            probe_image(cmd, pass().depth_tex, pass().depth_level, pass().depth_layer, pass().prog, 'z', pass().draws);
+    }
     if (pass_trace_on()) {
         char sampled[160] = "";
         int k = 0;
@@ -4225,6 +4301,8 @@ void end_pass(VkCommandBuffer cmd) {
 
 const std::vector<uint64_t>& record_progs();
 void record_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at);
+bool trace_on();
+void trace_op(const char* kind, const NvnState& s, const Program* p, const Targets* at, const char* args);
 void probe_draw(const NvnState& s, const Program& p, int pass_draws);
 /// (RX_VK_DUMP_ARGS=<key>[,<key>...] (hex; 1: every draw): in a dump, each draw of those programs logged with its
 /// arguments, its indirect arguments as guest memory holds them, its vertex buffers and the first words of the vertex
@@ -4619,6 +4697,21 @@ void stats_tick() {
                     (unsigned long long)x.mesh, (unsigned long long)x.clip_in, (unsigned long long)x.clip_out,
                     (unsigned long long)x.fs, k == 0 ? "RAN, NO PRIMITIVES" : k == 1 ? "primitives, no fragments" : k == 2 ? "no shader work" : "",
                     x.indirect ? (" (indirect)" + x.args).c_str() : "");
+        }
+        // (RX_VK_DRAW_STATS_EACH=1: every draw on its own, in recording order: an element that drew nothing in one frame and
+        // something in the next, the same draw by its program, count, instances and rank among those alike)
+        if (getenv("RX_VK_DRAW_STATS_EACH") && res == VK_SUCCESS) {
+            fprintf(f, "\n# each draw: i kind prog count inst rank | vs mesh | clip_in clip_out | fs\n");
+            std::map<std::tuple<uint64_t, int32_t, int32_t>, int> rank;
+            for (uint32_t i = 0; i < n; i++) {
+                const StatsMeta& m = stats_meta[i];
+                if (m.dispatch) continue;
+                const uint64_t* v = &r[(size_t)i * words];
+                fprintf(f, "E %u %s %016llx %d %d %d | %llu %llu | %llu %llu | %llu\n", i, m.mesh ? "mesh" : m.indirect ? "ind" : "draw",
+                        (unsigned long long)m.prog, m.count, m.instances, rank[{m.prog, m.count, m.instances}]++, (unsigned long long)v[0],
+                        (unsigned long long)(stats_mesh_bits ? v[6] : 0), (unsigned long long)v[1], (unsigned long long)v[2],
+                        (unsigned long long)v[3]);
+            }
         }
         // who binds each indirect draw's argument words in this frame: written (W) or only read (r), by which programs
         std::vector<StatsBind> binds;
@@ -5721,6 +5814,11 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
             mask_guard = {cmd, at.color[0], at.color_level[0], at.color_layer[0], mw};
     if (!record_progs().empty() && std::find(record_progs().begin(), record_progs().end(), p.key) != record_progs().end())
         record_draw(s, p, d, at);
+    if (trace_on()) {
+        char a[64];
+        snprintf(a, sizeof a, "count %d inst %d%s", d.count, d.instances, d.indirect ? " indirect" : "");
+        trace_op("draw", s, &p, &at, a);
+    }
     // (RX_VK_DUMP_EACH=<key>,...: in a dump, the pass ends after each draw of those programs, so every one of them is
     // read back on its own)
     struct EachGuard {
@@ -7203,6 +7301,12 @@ void dispatch(VkCommandBuffer cmd, NvnState& s, uint32_t x, uint32_t y, uint32_t
         st_waits++;
         st_wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
+    if (trace_on()) {
+        char a[64];
+        snprintf(a, sizeof a, "grid %ux%ux%u%s%s", s.grid[0], s.grid[1], s.grid[2], indirect ? " indirect" : "",
+                 !cp ? " noprog" : cp->failed ? " failed" : "");
+        trace_op("dispatch", s, cp, nullptr, a);
+    }
     if (!cp || cp->failed) {   // (hookshot) the program's resources, once a control section: what a rejected dispatch reads/writes
         static std::mutex mu2;
         static std::unordered_set<uint64_t> seen2;
@@ -7601,6 +7705,112 @@ const std::vector<uint64_t>& record_progs() {
     }();
     return v;
 }
+// (hookshot) RX_VK_TRACE_FRAMES=<from>-<to> with RX_VK_TRACE_FILE=<path> (a diagnosis): every draw and dispatch of those texture
+// frames, one line each, written as recorded: the frame, the program, what it samples and may write (texture slots and their storage),
+// the images it renders to (creation numbers and storage), and each stage's uniform buffers with a hash of their first 512 bytes as
+// guest memory holds them. What reads what, frame after frame: the trace of a flicker that comes and goes
+namespace {
+std::mutex optrace_mu;
+FILE* optrace_file = nullptr;
+uint64_t optrace_from = 1, optrace_to = 0;
+}
+bool trace_on() {
+    static const bool on = [] {
+        const char* r = getenv("RX_VK_TRACE_FRAMES");
+        const char* path = getenv("RX_VK_TRACE_FILE");
+        if (!r || !path) return false;
+        unsigned long long a = 0, b = 0;
+        if (sscanf(r, "%llu-%llu", &a, &b) != 2 || b < a) return false;
+        optrace_from = a, optrace_to = b;
+        optrace_file = fopen(path, "w");
+        if (optrace_file) logf("vk: trace of texture frames %llu to %llu in %s", a, b, path);
+        return optrace_file != nullptr;
+    }();
+    if (!on) return false;
+    const uint64_t f = texture_frame_no();
+    return f >= optrace_from && f <= optrace_to;
+}
+/// (a line of the replay's own, in the same order: submits, event signals and waits)
+void trace_text(const char* text) {
+    if (!trace_on()) return;
+    char b[32];
+    snprintf(b, sizeof b, "%llu ", (unsigned long long)texture_frame_no());
+    std::lock_guard lk(optrace_mu);
+    fputs(b, optrace_file);
+    fputs(text, optrace_file);
+    fputc('\n', optrace_file);
+    fflush(optrace_file);
+}
+void trace_op(const char* kind, const NvnState& s, const Program* p, const Targets* at, const char* args) {
+    std::string line;
+    char b[160];
+    snprintf(b, sizeof b, "%llu %s %016llx %s |", (unsigned long long)texture_frame_no(), kind,
+             (unsigned long long)(p ? p->key : 0), args);
+    line += b;
+    if (p) line += program_bindings(s, *p);
+    if (at) {
+        line += " |";
+        for (int i = 0; i < at->n && i < 8; i++)
+            if (const Texture* t = at->color[i]) {
+                snprintf(b, sizeof b, " c%d#%u@%llx:%ux%u:%x", i, t->id, (unsigned long long)t->gpu, t->width, t->height,
+                         (unsigned)t->nvn_format);   // (the image's own size and format; the pass may draw a part of it)
+                line += b;
+            }
+        if (const Texture* t = at->depth) {
+            snprintf(b, sizeof b, " d#%u@%llx", t->id, (unsigned long long)t->gpu);
+            line += b;
+        }
+    }
+    if (p) {
+        line += " |";
+        for (const Stage& st : p->stages) {
+            const int ns = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+            for (int i = 0; i < 16; i++) {
+                const nvn_p_bind_buf& u = s.ubo[ns][i];
+                if (!u.addr || !(i + 3 < Shader::Info::MAX_CBUFS && st.info.constant_buffer_used_sizes[i + 3])) continue;
+                // (the bytes the program reads of it, as the translator found them: a constant far into a 64 KB buffer counts too)
+                static thread_local std::vector<uint8_t> m;
+                const uint64_t used = st.info.constant_buffer_used_sizes[i + 3];
+                const uint64_t k = std::min<uint64_t>(u.size ? u.size : used, std::min<uint64_t>(used, 64 << 10));
+                m.resize((size_t)k);
+                uint64_t h = 1469598103934665603ull;
+                if (k && host->gpu_read(u.addr, m.data(), k))
+                    for (uint64_t j = 0; j < k; j++) h = (h ^ m[j]) * 1099511628211ull;
+                snprintf(b, sizeof b, " s%dc%d@%llx:%llx:%016llx", ns, i + 3, (unsigned long long)u.addr,
+                         (unsigned long long)u.size, (unsigned long long)h);
+                line += b;
+            }
+        }
+        // (the storage buffers, as the probe finds them: their address in the stage's constants, their size, and a hash of what
+        // the submission's capture holds of them (64 KB at most); w: the program may write it)
+        line += " |";
+        static thread_local std::vector<uint8_t> sb;
+        for (const Stage& st : p->stages) {
+            const int ns = std::clamp(st.nvn_stage, 0, kNvnStages - 1);
+            for (const auto& d : st.info.storage_buffers_descriptors)
+                for (uint32_t k = 0; k < d.count && k < 8; k++) {
+                    const uint32_t off = d.cbuf_offset + k * 16;
+                    const uint64_t addr = stage_cbuf_word(s, st, d.cbuf_index, off) |
+                                          (uint64_t)stage_cbuf_word(s, st, d.cbuf_index, off + 4) << 32;
+                    const uint64_t size = stage_cbuf_word(s, st, d.cbuf_index, off + 8);
+                    const uint64_t n = std::min<uint64_t>(size, 64ull << 10);   // (64 KB: the trace keeps the game's speed)
+                    sb.resize((size_t)n);
+                    uint64_t h = 1469598103934665603ull;
+                    const bool read = addr && n && memory_read_as_submitted(addr, sb.data(), n);
+                    if (read)
+                        for (uint64_t j = 0; j < n; j++) h = (h ^ sb[j]) * 1099511628211ull;
+                    snprintf(b, sizeof b, " b%dc%u+%x%s@%llx:%llx:%016llx", ns, (unsigned)d.cbuf_index, off, d.is_written ? "w" : "",
+                             (unsigned long long)addr, (unsigned long long)size, read ? (unsigned long long)h : 0ull);
+                    line += b;
+                }
+        }
+    }
+    line += '\n';
+    std::lock_guard lk(optrace_mu);
+    fputs(line.c_str(), optrace_file);
+    fflush(optrace_file);   // (the session ends by killing the game: what was traced is on disk by then)
+}
+
 void record_draw(const NvnState& s, const Program& p, const DrawArgs& d, const Targets& at) {
     char line[1024];
     int n = snprintf(line, sizeof line, "prog %016llx count %d first %d inst %d bv %d bi %d idx %d ibuf %#llx ind %#llx/%#llx",

@@ -2198,6 +2198,36 @@ Texture* texture_get(const nvn_tex* t, bool for_sampling) {
     return texture_touch(tex, for_sampling);
 }
 
+/// (hookshot, RX_VK_TRACE_FRAMES) the image a description resolves to now, as texture_get would find it, without making, uploading or
+/// touching anything: its creation number (0: none yet), and whether the GPU drew it (and the game has not finalized it since)
+uint32_t texture_peek(const nvn_tex* t, bool* rendered) {
+    *rendered = false;
+    if (!t || !t->gpu || t->d.target == NVN_TEXTURE_TARGET_BUFFER) return 0;
+    const VkFormatInfo fi = vk_format(t->d.format);
+    if (fi.format == VK_FORMAT_UNDEFINED) return 0;
+    int bw = 1, bh = 1;
+    const int bpb = nvn_block_size(t->d.format, &bw, &bh);
+    if (bpb <= 0) return 0;
+    Key k{};   // (as texture_get makes it)
+    k.gpu = t->gpu;
+    k.target = (uint32_t)t->d.target;
+    if (k.target == NVN_TEXTURE_TARGET_CUBEMAP) k.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+    if (k.target == NVN_TEXTURE_TARGET_CUBEMAP_ARRAY) k.target = NVN_TEXTURE_TARGET_2D_ARRAY;
+    if (k.target == NVN_TEXTURE_TARGET_RECTANGLE) k.target = NVN_TEXTURE_TARGET_2D;
+    k.width = t->d.width, k.height = t->d.height;
+    k.depth = t->d.target == NVN_TEXTURE_TARGET_CUBEMAP ? 6 : t->d.depth;
+    if (k.target == NVN_TEXTURE_TARGET_2D) k.depth = 1;
+    k.levels = std::max(1u, t->d.levels);
+    k.samples = std::max(1, t->d.samples);
+    k.layout = nvn_tex_is_linear(&t->d) ? 0x80000000u | (t->d.stride ? t->d.stride : host->tex_linear_stride(&t->d))
+                                        : t->L.tileH | t->L.tileD << 4;
+    k.cls = format_class(fi.format, t->d.format, bpb, fi.astc);
+    const auto it = textures.find(k);
+    if (it == textures.end()) return 0;
+    *rendered = it->second->gpu_written && !it->second->released;
+    return it->second->id;
+}
+
 uint64_t texture_destroy_generation() {
     return destroy_gen;
 }

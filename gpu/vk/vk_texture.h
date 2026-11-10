@@ -134,6 +134,7 @@ uint64_t texture_destroy_generation();
 /// The texture an NVN texture's storage is (made and uploaded at first use, uploaded again when the CPU wrote its
 /// storage since). null for formats and targets that have no image (buffers, unknown formats).
 Texture* texture_get(const nvn_tex* t, bool for_sampling);
+uint32_t texture_peek(const nvn_tex* t, bool* rendered);   // (RX_VK_TRACE_FRAMES: the image it resolves to, nothing made)
 /// A view of it: the view's levels and layers (all when v is null), as view_type, in the view's format
 /// (attachment: one level, one layer; storage: one level, every layer, in a storage-capable format)
 enum class ViewUse { Sample, Attachment, Storage };

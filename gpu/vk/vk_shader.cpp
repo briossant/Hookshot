@@ -1981,6 +1981,33 @@ std::string program_textures(const NvnState& s, const Program& p) {
     return out;
 }
 
+uint32_t texture_peek(const nvn_tex* t, bool* rendered);   // (vk_texture.cpp)
+/// (hookshot, RX_VK_TRACE_FRAMES) the program's textures and storage images as they resolve now, with their storage: " t<slot>@<gpu>:<w>x<h>:<fmt>"
+/// for what it samples, " i<slot>@..." for what it may write. Which memory a draw reads and writes, for the trace's readers and writers
+std::string program_bindings(const NvnState& s, const Program& p) {
+    std::string out;
+    char b[96];
+    const auto one = [&](char kind, uint32_t h) {
+        nvn_tex t;
+        nvn_view v;
+        bool has_view = false;
+        if (h && texture_of((int)(h & 0xFFFFF), &t, &v, &has_view)) {
+            bool rendered = false;
+            const uint32_t id = texture_peek(&t, &rendered);   // (the image a draw gets for it: #0 none yet, r drawn by the GPU)
+            snprintf(b, sizeof b, " %c%x@%llx:%ux%u:%x#%u%s", kind, h & 0xFFFFF, (unsigned long long)t.gpu, (unsigned)t.d.width,
+                     (unsigned)t.d.height, (unsigned)t.d.format, id, rendered ? "r" : "");
+        }
+        else
+            snprintf(b, sizeof b, " %c%x@?", kind, h & 0xFFFFF);
+        out += b;
+    };
+    for (const Stage& st : p.stages) {
+        for (const auto& d : st.info.texture_descriptors) one('t', descriptor_handle(s, st, d));
+        for (const auto& d : st.info.image_descriptors) one('i', descriptor_handle(s, st, d));
+    }
+    return out;
+}
+
 std::string program_code_keys(const NvnState& s) {
     std::string out;
     if (!s.has_prog) return out;
