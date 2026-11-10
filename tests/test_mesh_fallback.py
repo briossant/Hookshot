@@ -156,7 +156,9 @@ def main():
         raise SystemExit("a fallback mesh workgroup's id is its slot, not its index in its task")
     # (the records' header is reset after a barrier: the shared pair's last draw, of any program, has read it)
     reset = record[record.index("end_pass(cmd);"):record.index("vkCmdFillBuffer(cmd, f->records")]
-    if "full_barrier(cmd);" not in reset:
+    # (a full barrier, or the targeted one from the stages the last draw read them in: tests/test_mesh_fallback_barriers.py)
+    targeted = "fallback_barrier(cmd, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT"
+    if "full_barrier(cmd);" not in reset and targeted not in reset:
         raise SystemExit("a fallback draw resets the shared records before the last draw has read them")
     if "vkCmdFillBuffer(cmd, f->records, 4, 4, 1);" not in record:
         raise SystemExit("the draw's instance count is not set to one")
@@ -172,7 +174,8 @@ def main():
         raise SystemExit("a fallback draw reusing its descriptors after a dispatch pushes the dispatch's at the compute bind point")
     # (the pair is shared by a recording thread's programs (#1383): its clears wait for the last fallback draw's reads)
     shared = block(draw, "bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {")
-    if "full_barrier(cmd);" not in shared[shared.index("end_pass(cmd);"):shared.index("vkCmdFillBuffer(cmd, f->records")]:
+    clears = shared[shared.index("end_pass(cmd);"):shared.index("vkCmdFillBuffer(cmd, f->records")]
+    if "full_barrier(cmd);" not in clears and targeted not in clears:
         raise SystemExit("a fallback draw clears the shared buffers before the last draw has read them")
     if "VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT" not in VMA.read_text(encoding="utf-8"):
         raise SystemExit("the allocator does not make the fallback's buffers addressable")
