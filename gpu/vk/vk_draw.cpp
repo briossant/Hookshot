@@ -5080,6 +5080,22 @@ uint64_t fallback_buffer_address(VkBuffer buffer) {
     return vkGetBufferDeviceAddress(dev.device, &info);
 }
 
+/// (hookshot) The fallback's own hazards, each from the stages that touched its buffers last to the ones that touch them next, not
+/// a full barrier: those waited for every stage of all the work before (the pass the fallback ends included) four times a fallback
+/// draw, 464 full barriers a frame in a dense Hyrule Field view (116 fallback draws, RX 5500M), and the GPU idled between its many
+/// small dispatches. What the fallback reads of the game's memory is ordered by the game's own barriers, as on the console, and the
+/// pass that follows starts with pass_start_barrier. RX_VK_FALLBACK_FULL_BARRIERS=1: full barriers, as before (an A/B)
+void fallback_barrier(VkCommandBuffer cmd, VkPipelineStageFlags2 src, VkAccessFlags2 src_access, VkPipelineStageFlags2 dst,
+                      VkAccessFlags2 dst_access) {
+    static const bool full = getenv("RX_VK_FALLBACK_FULL_BARRIERS") && atoi(getenv("RX_VK_FALLBACK_FULL_BARRIERS")) != 0;
+    if (full) return full_barrier(cmd);
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
+    b.srcStageMask = src, b.srcAccessMask = src_access, b.dstStageMask = dst, b.dstAccessMask = dst_access;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+}
+
 bool fallback_buffers_of(const Program& p, FallbackBuffers*& out) {
     if (!p.fallback_vertices_per_workgroup || !p.fallback_record_words) return false;
     const uint64_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
@@ -5193,8 +5209,11 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     fallback_records_address = f->records_address;
     const uint32_t capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
     end_pass(cmd);
-    // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset)
-    full_barrier(cmd);
+    // (the shared pair: the last fallback draw on it, of any program of this thread, has read it before it is reset: its
+    // indirect draw and vertex stage read the records, its dispatches wrote them and read the payloads)
+    fallback_barrier(cmd, VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                     VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
     const uint32_t groups{(uint32_t)std::clamp(d.groups[0], 0, (int)capacity)};
     // (the records' header: the draw's command with no vertices and one instance, the allocator at 0, and the mesh dispatch
     // with no workgroups, its y and z 1. The records past it need nothing: the draw reaches only those taken this time; nor
@@ -5206,7 +5225,10 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     vkCmdFillBuffer(cmd, f->records, 8, 16, 0);   // (firstVertex, firstInstance, the allocator, the dispatch's x)
     vkCmdFillBuffer(cmd, f->records, 24, 8, 1);   // (the dispatch's y and z)
     fallback_draw_records = f->records;
-    full_barrier(cmd);
+    // (the header, before the dispatches' atomics on it and the mesh dispatch's indirect read)
+    fallback_barrier(cmd, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                     VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
     if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p)) return false;
     push_constants(cmd, p, nullptr);
     size_t stages[2] = {p.stages.size(), p.stages.size()};
@@ -5241,12 +5263,18 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     };
     if (p.fallback_task) {
         if (!send(stages[0], false)) return false;
-        full_barrier(cmd);
+        // (the task's map, payloads and the mesh dispatch's count, before the mesh dispatch reads them)
+        fallback_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                         VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT);
         if (!send(stages[1], true)) return false;
     } else {
         if (!send(stages[0], true)) return false;
     }
-    full_barrier(cmd);   // (the records and the draw's command, which the draw reads as indirect arguments)
+    // (the records and the draw's command, which the draw reads as indirect arguments and its vertex stage as storage; and
+    // whatever else the game's mesh program wrote, for every later stage)
+    fallback_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
     return true;
 }
 } // namespace
