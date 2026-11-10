@@ -5385,6 +5385,10 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     const bool indirect{d.indirect && mesh_conv_buf != VK_NULL_HANDLE};
     auto send = [&](size_t stage, bool mesh_stage) {
         if (stage >= p.fallback_compute.size() || !p.fallback_compute[stage]) return false;
+        char fb_label[64] = "";   // (hookshot, RX_VK_PASS_TIMING: each of the fallback's dispatches, between the passes it splits)
+        if (gprof_on())
+            snprintf(fb_label, sizeof fb_label, "fallback %s prog %016llx", mesh_stage ? "mesh" : "task", (unsigned long long)p.key);
+        GprofSpan fb_span(cmd, fb_label);
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.fallback_compute[stage]);
         if (mesh_stage && p.fallback_task) {
             // (the mesh workgroups the task's started threads counted into the records' header, each its slot in the map:
