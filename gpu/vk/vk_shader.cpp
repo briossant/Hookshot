@@ -1288,6 +1288,7 @@ void put_head(std::vector<uint8_t>& o, const Program& p) {
 void get_head(Reader& r, Program& p) {
     const uint32_t kind = r.get<uint32_t>();
     p.compute = (kind & 1) != 0, p.mesh = (kind & 2) != 0, p.fallback = (kind & 4) != 0, p.fallback_task = (kind & 8) != 0;
+    if (p.fallback) p.mesh = false;   // (hookshot: the seed's fallback programs were kept marked mesh too; see seed_translate)
     r.list(p.answers);
     r.list(p.questions);
     p.workgroup = r.get<std::array<uint32_t, 3>>();
@@ -2467,8 +2468,13 @@ std::unique_ptr<Program> seed_translate(const SeedStage* const by_stage[8], cons
     auto p = std::make_unique<Program>();
     p->key = key;
     p->compute = by_stage[5] != nullptr;
-    p->mesh = by_stage[7] != nullptr;
-    if (p->mesh)
+    // (hookshot: as play makes it, mesh_program_locked: a fallback one is an ordinary graphics pipeline. Marked mesh, its pipeline
+    // had no input assembly and drew points (build_graphics))
+    const bool mesh = by_stage[7] != nullptr;
+    if (mesh && !dev.mesh_shader && !dev.mesh_fallback) return nullptr;
+    p->mesh = mesh && dev.mesh_shader;
+    p->fallback = mesh && !dev.mesh_shader;
+    if (mesh)
         translate_mesh_into(*p, *blank, by_stage[6] ? &code[6] : nullptr, code[7], nullptr, by_stage[1] ? &code[1] : nullptr, color_types);
     else if (p->compute) {
         seed_cs_control = seed.blob.data() + by_stage[5]->control;

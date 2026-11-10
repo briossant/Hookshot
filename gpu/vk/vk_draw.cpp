@@ -1322,7 +1322,7 @@ VkPipeline gpl_link(const Program& p, const NvnState& s, const Targets& at, VkPr
     output = mix(output, at.depth ? (uint64_t)at.depth_format : 0);
     VkPipeline libs[4];
     uint32_t n = 0;
-    if (!p.mesh) libs[n++] = gpl_part(p, s, at, topo, 0, input, nullptr);
+    if (!p.mesh || p.fallback) libs[n++] = gpl_part(p, s, at, topo, 0, input, nullptr);
     libs[n++] = gpl_part(p, s, at, topo, 1, program, &cold[0]);
     libs[n++] = gpl_part(p, s, at, topo, 2, mix(program, (uint64_t)at.samples), &cold[1]);
     libs[n++] = gpl_part(p, s, at, topo, 3, output, nullptr);
@@ -1602,7 +1602,13 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
         VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_LINE_WIDTH,
         VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE};
-    if (!p.mesh) {
+    // (hookshot) a mesh program run by the fallback is an ordinary vertex pipeline, whatever its flags say: the seed's translation
+    // (seed_translate) marked such programs mesh too, and their pipelines were built with no input assembly and no dynamic topology.
+    // Vulkan took the topology as 0, points: the fallback's foliage drew as points, and binding one of them left the command
+    // buffer's topology at points under the replay's cache of it, so the next draws of the same topology drew as points too (the
+    // ground gone from a frame, the sky's light where it was, the bloom 40 times too bright; 3 frames in 8 on a Vega 6)
+    const bool native_mesh = p.mesh && !p.fallback;
+    if (!native_mesh) {
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY);
         dyn.push_back(VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE);
         dyn.push_back(VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE);
@@ -1629,8 +1635,8 @@ VkPipeline build_graphics(const Program& p, const NvnState& s, const Targets& at
     ci.pNext = &ri;
     ci.stageCount = (uint32_t)stages.size();
     ci.pStages = stages.data();
-    ci.pVertexInputState = p.mesh ? nullptr : &vi;
-    ci.pInputAssemblyState = p.mesh ? nullptr : &ia;
+    ci.pVertexInputState = native_mesh ? nullptr : &vi;
+    ci.pInputAssemblyState = native_mesh ? nullptr : &ia;
     ci.pViewportState = &vp;
     ci.pRasterizationState = &rs;
     ci.pMultisampleState = &ms;
