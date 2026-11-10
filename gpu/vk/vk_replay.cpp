@@ -334,8 +334,17 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
         signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
         nsig++;
         std::lock_guard mk(rec_map_mu);
-        for (uint64_t v : rec_open_values) value_rec.emplace(v, seq);
-        if (r.value) value_rec.emplace(r.value, seq);
+        // (hookshot: the last recording a value's work is in, not the first. maybe_split ends a submission's recording every
+        // RX_VK_CHUNK draws and goes on in another of the same value: a fence's wait (wait_recorded) came back at the first
+        // part, the rest still to run, and the game rewrote what it reads. One-frame flashes with per-queue fences, 13 a minute)
+        for (uint64_t v : rec_open_values) {
+            uint64_t& at = value_rec[v];
+            at = std::max(at, seq);
+        }
+        if (r.value) {
+            uint64_t& at = value_rec[r.value];
+            at = std::max(at, seq);
+        }
         rec_open_values.clear();
         while (value_rec.size() > 8192) value_rec.erase(value_rec.begin());
     }
@@ -2025,7 +2034,11 @@ void drain(int why) {
 bool async_on();
 /// RX_VK_PER_QUEUE_FENCES=0: a fence waits for every queue's work up to it, stopped work forced on, as before
 bool per_queue_fences_off() {
-    static const bool v = getenv("RX_VK_PER_QUEUE_FENCES") && atoi(getenv("RX_VK_PER_QUEUE_FENCES")) == 0;
+    static const bool v = [] {
+        const bool off = getenv("RX_VK_PER_QUEUE_FENCES") && atoi(getenv("RX_VK_PER_QUEUE_FENCES")) == 0;
+        logf("vk: fences %s (RX_VK_PER_QUEUE_FENCES)", off ? "wait for every queue's work" : "per queue");   // (hookshot: which, in the log)
+        return off;
+    }();
     return v;
 }
 std::mutex sync_order_mu;   // (before replay_mu, always; all of the order's state: qruns, burst_*)
