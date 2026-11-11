@@ -115,6 +115,10 @@ struct Profile {
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
 
+    /// (hookshot) Global memory loads try the guest page table before the search of the bound storage buffers (no buffer
+    /// mirrors: the table maps the memory the buffers are bound from), and the task and mesh stages follow pointers too
+    bool global_table_first{};
+
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
     }

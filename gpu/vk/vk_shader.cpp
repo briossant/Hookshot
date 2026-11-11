@@ -75,6 +75,7 @@ struct NvnState;
 uint32_t compute_ssbo_table(const NvnState& s, uint32_t* count, uint32_t* layout_end);   // (vk_bank.cpp)
 bool seed_cs_buffer_word(uint32_t offset);   // (vk_bank.cpp)
 bool key_listed(const char* hex, const char* var);   // (below)
+bool memory_mirrors_on();   // (vk_memory.cpp)
 }
 namespace {
 bool ptr_diag_on() {
@@ -542,6 +543,14 @@ Shader::Profile make_profile() {
     // driver; in the cache's stamp)
     if (const char* e = getenv("RX_VK_FRAG_SHUFFLE_FALLBACK")) p.has_broken_spirv_fragment_shuffle = e[0] == '1';
     p.min_ssbo_alignment = dev.props.limits.minStorageBufferOffsetAlignment;
+    // (hookshot) global loads through the page table first where no buffer has a mirror (an integrated GPU's default): the
+    // search of the bound buffers, inlined at every access, was most of the culling's and the mesh fallback's code. Vega 6:
+    // GPU 41.3 -> 36.1 ms a frame, 20.9 -> 23.5 fps, the same draws' statistics. EDEN_NX2_GM_TABLE_FIRST=0 / 1: off / on
+    // whatever the mirrors (in the cache's stamp, as this flag is)
+    {
+        const char* e = getenv("EDEN_NX2_GM_TABLE_FIRST");
+        p.global_table_first = e ? atoi(e) != 0 : !memory_mirrors_on();
+    }
     return p;
 }
 
@@ -1059,7 +1068,8 @@ uint64_t disk_stamp() {
     // (and what of the GPU the translator is told (make_profile): its warps' lanes and the driver's shuffle workaround, and
     // which stages it pins to 32 lanes, which keep the short path: profile_graphics)
     const uint32_t lanes[] = {profile().warp_size_potentially_larger_than_guest ? 1u : 0u, profile().max_subgroup_size,
-                              profile().has_broken_spirv_fragment_shuffle ? 1u : 0u, (uint32_t)dev.sg32_stages};
+                              profile().has_broken_spirv_fragment_shuffle ? 1u : 0u, (uint32_t)dev.sg32_stages,
+                              profile().global_table_first ? 1u : 0u};   // (hookshot: and where global loads go first)
     add(lanes, sizeof lanes);
     // (the records keep Shader::Info as it lies in memory: a cache written by another C++ library (the MSVC build's, then the
     // llvm-mingw one's libc++) has other layouts, and reading it crashed at start. The library and the sizes, so it starts again)

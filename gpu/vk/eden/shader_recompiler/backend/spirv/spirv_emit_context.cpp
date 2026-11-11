@@ -1079,7 +1079,9 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // (the culling; a graphics stage with it hung the renderer at a load. RX_VK_NO_FOLLOW: none of it, as before)
     static const bool no_follow{getenv("RX_VK_NO_FOLLOW") != nullptr};
     // (RX_VK_FOLLOW_MESH=1: the task and mesh stages too. Tried for the foliage, which it did not bring back: off)
-    static const bool no_mesh{getenv("RX_VK_FOLLOW_MESH") == nullptr};
+    // (hookshot: and with the page table first, profile.global_table_first: the mesh fallback's loads were most of its time)
+    static const bool follow_mesh_env{getenv("RX_VK_FOLLOW_MESH") != nullptr};
+    const bool no_mesh{!follow_mesh_env && !profile.global_table_first};
     // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
     // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
     // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block.
@@ -1360,12 +1362,24 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
                                     function_type)};
         const Id addr{OpFunctionParameter(U64)};
+        // (hookshot) Profile::global_table_first: the page table first, the search of the bound buffers only for what it does not
+        // map. The search is a range test of every storage buffer the program has, each one's bounds read from its constant
+        // buffer and its descriptor at every access, and the driver inlines it at each of them: a culling program's 47 loads were
+        // 670 KB of AMD code with 13348 scalar registers spilled, a mesh fallback program's 73 the 256 vector registers of a SIMD
+        // (one wave of it on a Vega). The table maps a guest page to the memory its pool is bound from (its mirror once it has
+        // one, vk_memory.cpp), so a load it maps reads what the search would have found
+        const bool first{profile.global_table_first && follow_pointers && gp_level >= 3};
+        if (first) {
+            AddLabel();
+            guest_lookup(addr, 1U << shift, [&](Id target) { OpReturnValue(psb_load(type, target, 4U)); });
+        }
         define_body(ssbo_member, addr, element_pointer, shift,
-                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); });
-        guest_lookup(addr, 1U << shift, [&](Id target) {
-            if (gp_level >= 3) OpReturnValue(psb_load(type, target, 4U));
-            else OpReturnValue(ConstantNull(type));
-        });
+                    [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); }, !first);
+        if (!first)
+            guest_lookup(addr, 1U << shift, [&](Id target) {
+                if (gp_level >= 3) OpReturnValue(psb_load(type, target, 4U));
+                else OpReturnValue(ConstantNull(type));
+            });
         OpReturnValue(ConstantNull(type));
         OpFunctionEnd();
         return func_id;
