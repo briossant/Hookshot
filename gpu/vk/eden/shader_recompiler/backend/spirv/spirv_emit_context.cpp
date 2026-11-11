@@ -1372,6 +1372,23 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         if (first) {
             AddLabel();
             guest_lookup(addr, 1U << shift, [&](Id target) { OpReturnValue(psb_load(type, target, 4U)); });
+            // (RX_VK_TEST_GM_TABLE_ONLY, a test with RX_VK_RETRANSLATE: no search at all, an access across a page word by word
+            // through the 32-bit loader, anything else the table does not map 0. What the search's code costs; not in the stamp)
+            static const bool table_only{getenv("RX_VK_TEST_GM_TABLE_ONLY") != nullptr};
+            if (table_only) {
+                if (shift > 2 && Sirit::ValidId(load_global_func_u32)) {
+                    std::vector<Id> words;
+                    for (u32 w = 0; w < (1U << (shift - 2)); ++w) {
+                        const Id at{OpIAdd(U64, addr, Constant(U64, u64{w * 4U}))};
+                        words.push_back(OpFunctionCall(U32[1], load_global_func_u32, std::span<const Id>(&at, 1)));
+                    }
+                    OpReturnValue(OpCompositeConstruct(type, words));
+                } else {
+                    OpReturnValue(ConstantNull(type));
+                }
+                OpFunctionEnd();
+                return func_id;
+            }
         }
         define_body(ssbo_member, addr, element_pointer, shift,
                     [&](Id ssbo_pointer) { OpReturnValue(OpLoad(type, ssbo_pointer)); }, !first);
