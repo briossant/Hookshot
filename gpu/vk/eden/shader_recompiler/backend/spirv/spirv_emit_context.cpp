@@ -1132,8 +1132,37 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // (hookshot) size: the access's bytes. An access that runs past its 4 KB page is left to the miss path: the table maps pages one
     // by one, the next page may be another allocation's or none, and a 16-byte read at a page's end faulted the device (the culling
     // passes 53caac5f, b6122162 at a save's load)
+    // (hookshot) the page last found in the table, an invocation's own (Private): its number and its device address. With the
+    // table first (Profile::global_table_first) every global load went through it, two dependent loads each: the entry, a wait
+    // for every load in flight (s_waitcnt vmcnt(0) on AMD), then the data. At one or two waves a SIMD (the mesh fallback, the
+    // culling) nothing hid that latency. The loads a program makes from one structure or array are mostly in one page: the
+    // entry is read once. The table does not change during a draw or a dispatch, so this reads what the table would.
+    // EDEN_NX2_GM_PAGE_CACHE=0: off
+    static const bool page_cache_env{!getenv("EDEN_NX2_GM_PAGE_CACHE") || getenv("EDEN_NX2_GM_PAGE_CACHE")[0] != '0'};
+    const bool page_cache{page_cache_env && profile.global_table_first && follow_pointers && gp_level >= 3};
+    Id cached_tag{}, cached_page{};
+    if (page_cache) {
+        const Id private_u64{TypePointer(spv::StorageClass::Private, U64)};
+        cached_tag = AddGlobalVariable(private_u64, spv::StorageClass::Private, Constant(U64, ~u64{0}));
+        cached_page = AddGlobalVariable(private_u64, spv::StorageClass::Private, Constant(U64, u64{0}));
+        Name(cached_tag, "gm_cached_tag"), Name(cached_page, "gm_cached_page");
+        if (profile.supported_spirv >= 0x00010400) interfaces.push_back(cached_tag), interfaces.push_back(cached_page);
+    }
     const auto guest_lookup = [&](Id addr, u32 size, auto&& hit) {
         if (!follow_pointers || gp_level < 2) return;
+        const Id in_page{OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff}))};
+        const Id tag{OpShiftRightLogical(U64, addr, Const(12U))};
+        if (page_cache) {   // (the page last found: no read of the table)
+            const Id fits_here{OpULessThanEqual(U1, in_page, Constant(U64, u64{0x1000 - size}))};
+            const Id same{OpLogicalAnd(U1, fits_here, OpIEqual(U1, tag, OpLoad(U64, cached_tag)))};
+            const Id same_label{OpLabel()};
+            const Id other_label{OpLabel()};
+            OpSelectionMerge(other_label, spv::SelectionControlMask::MaskNone);
+            OpBranchConditional(same, same_label, other_label);
+            AddLabel(same_label);
+            hit(OpIAdd(U64, OpLoad(U64, cached_page), in_page));
+            AddLabel(other_label);
+        }
         const Id table{wants_guest_pages && rescaling_push_constants.value != 0
                            ? OpLoad(U64, OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U64), rescaling_push_constants,
                                                        Const(guest_pages_member_index)))
@@ -1159,7 +1188,8 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         OpSelectionMerge(miss_label, spv::SelectionControlMask::MaskNone);
         OpBranchConditional(mapped, hit_label, miss_label);
         AddLabel(hit_label);
-        hit(OpIAdd(U64, page, OpBitwiseAnd(U64, addr, Constant(U64, u64{0xfff}))));
+        if (page_cache) OpStore(cached_tag, tag), OpStore(cached_page, page);
+        hit(OpIAdd(U64, page, in_page));
         AddLabel(miss_label);
         OpBranch(else_label);
         AddLabel(else_label);
