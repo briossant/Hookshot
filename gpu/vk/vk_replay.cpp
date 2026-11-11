@@ -160,6 +160,73 @@ bool batch_on() {
     }();
     return on && batch_tl != VK_NULL_HANDLE;
 }
+
+// ---- (hookshot) RX_VK_TL=<file>: a timeline of what holds a frame up, for RX_VK_TL_N presents (default 120) from present
+// RX_VK_TL_FROM (default 2700). One line an event, "<ns> <thread> <kind> <a> <b>": S/s a submit replayed (its value,
+// queue), P/p a present, W/w a wait for a fence (its value; the result), L/l a wait for late pages, F a batch sent to the
+// queue (its number, command buffers), G the GPU done with a batch (its number) and T with a submission (its value), both
+// seen by a thread that polls the semaphores every 200 us. A frame's critical path: tests/timeline in ~/zelda/dbg/tl.py ----
+struct TlEvent {
+    int64_t ns;
+    uint64_t a, b;
+    uint32_t tid;
+    char k;
+};
+std::mutex tl_mu;
+std::vector<TlEvent> tl_events;
+std::atomic<bool> tl_done{false};
+bool tl_on() {
+    static const bool on = getenv("RX_VK_TL") != nullptr;
+    return on;
+}
+bool tl_window() {
+    static const int64_t from = getenv("RX_VK_TL_FROM") ? atoll(getenv("RX_VK_TL_FROM")) : 2700;
+    static const int64_t n = getenv("RX_VK_TL_N") ? atoll(getenv("RX_VK_TL_N")) : 120;
+    return presents_now >= from && presents_now < from + n;
+}
+void tl_write_locked() {
+    static FILE* f = fopen(getenv("RX_VK_TL"), "w");
+    if (!f) return;
+    for (const TlEvent& e : tl_events)
+        fprintf(f, "%lld %u %c %llu %llu\n", (long long)e.ns, e.tid, e.k, (unsigned long long)e.a, (unsigned long long)e.b);
+    fflush(f);
+    tl_events.clear();
+}
+void tl(char k, uint64_t a = 0, uint64_t b = 0) {
+    if (!tl_on() || tl_done.load(std::memory_order_relaxed)) return;
+    if (!tl_window()) {
+        std::lock_guard lk(tl_mu);
+        if (!tl_events.empty()) tl_write_locked(), tl_done = true;   // (the window is over: written, and no more)
+        return;
+    }
+    static std::atomic<uint32_t> next_tid{0};
+    static thread_local const uint32_t tid = next_tid++;
+    const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    static std::once_flag poller;
+    std::call_once(poller, [] {
+        std::thread([] {
+            SetThreadDescription(GetCurrentThread(), L"mkw_vk timeline");
+            uint64_t last_b = 0, last_t = 0;
+            while (!tl_done.load()) {
+                uint64_t b = 0, t = 0;
+                if (batch_tl) vkGetSemaphoreCounterValue(dev.device, batch_tl, &b);
+                vkGetSemaphoreCounterValue(dev.device, timeline, &t);
+                if (b != last_b) tl('G', b), last_b = b;
+                if (t != last_t) tl('T', t), last_t = t;
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            }
+        }).detach();
+    });
+    std::lock_guard lk(tl_mu);
+    tl_events.push_back({ns, a, b, tid, k});
+    if (tl_events.size() >= 8192) tl_write_locked();
+}
+struct TlSpan {   // (an event and its end, the end's kind in lower case)
+    char k;
+    uint64_t a;
+    TlSpan(char kind, uint64_t v, uint64_t w = 0) : k(kind), a(v) { tl(k, a, w); }
+    ~TlSpan() { tl((char)(k | 0x20), a); }
+};
 } // namespace
 void queue_flush_locked() {   // (dev.present_mu held)
     if (pend.cbs.empty()) return;
@@ -185,6 +252,7 @@ void queue_flush_locked() {   // (dev.present_mu held)
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, VK_NULL_HANDLE);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: batched submit %llu failed (%d)", (unsigned long long)batch_next, (int)res);
+    tl('F', batch_next, pend.cbs.size());
     if (res == VK_ERROR_DEVICE_LOST) device_lost();
     batch_flushed = batch_next;
     st_flushes++, st_batched_cbs += (int64_t)pend.cbs.size();
@@ -234,6 +302,7 @@ void wait_value(uint64_t v) {
 uint64_t vk_timeline_completed() { return timeline ? completed() : 0; }
 void vk_timeline_wait(uint64_t v) {   // (at most 250 ms: a submission held back behind the caller's thread goes on without it)
     if (!timeline || completed() >= v) return;
+    TlSpan tls('L', v);
     queue_flush_for(FR_VALUE);
     VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
     wi.semaphoreCount = 1;
@@ -288,6 +357,7 @@ Recording& begin_recording(uint64_t value) {
     if (r.value) {
         PROF(PROF_SLOTWAIT);
         const auto t0 = std::chrono::steady_clock::now();
+        TlSpan tls('R', r.value);   // (RX_VK_TL: a wait for the GPU to be done with a slot's last recording)
         recording_wait(r);
         st_wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
         gpu_time_collect(r);
@@ -2164,6 +2234,7 @@ uint64_t fence_q(uint64_t queue) {
 }
 int wait(uint64_t f, uint64_t timeout_ns) {
     if (completed() >= f) return 1;
+    TlSpan tls('W', f);
     queue_flush_for(FR_WAIT);
     // (hookshot) a fence of one queue whose work up to it is recorded whole (none of it stopped): that work, not the other
     // queues' stopped work the timeline above waits for (which a wait for it forced past its waits after RX_VK_WAIT_HOLD_US)
@@ -4011,6 +4082,7 @@ void submit_q(const uint64_t* handles, int n, uint64_t queue) {
                 value_queue[value] = queue;
                 while (value_queue.size() > 8192) value_queue.erase(value_queue.begin());
             }
+            TlSpan tls('S', value, queue);
             submit_job(h, value, queue);
             update_blocked();
             return;
@@ -4028,6 +4100,7 @@ void submit(const uint64_t* handles, int n) {
     submit_q(handles, n, 0);
 }
 void present(const nvn_tex* t, const int crop[4]) {
+    TlSpan tls('P', (uint64_t)presents_now);
     if (!async_on()) {
         std::lock_guard order(sync_order_mu);
         ReplayPin pin;   // (the frame's last replays and the present on the replay's core)

@@ -228,8 +228,10 @@ void gprof_report(int frames) {
         logf("vk:     %c %-9s %7.3f ms %5.1f%%  %7.1f spans  %8.1f items  %7.2f MB  %7.1f us a span", c.k ? 'u' : 'm', c.name.c_str(),
              c.a.ns / f / 1e6, 100.0 * c.a.ns / std::max(active_ns[c.k], 1.0), c.a.n / f, c.a.items / f, c.a.bytes / f / mb,
              c.a.ns / std::max<int64_t>(c.a.n, 1) / 1e3);
-    logf("vk:   the 25 spans that took the most (ms a frame, spans a frame, us a span, items a frame, MB a frame):");
-    for (size_t i = 0; i < rows.size() && i < 25; i++) {
+    // (hookshot) RX_VK_PASS_TIMING_ROWS=<n>: that many spans (default 25)
+    static const size_t nrows = getenv("RX_VK_PASS_TIMING_ROWS") ? (size_t)std::max(1, atoi(getenv("RX_VK_PASS_TIMING_ROWS"))) : 25;
+    logf("vk:   the %zu spans that took the most (ms a frame, spans a frame, us a span, items a frame, MB a frame):", nrows);
+    for (size_t i = 0; i < rows.size() && i < nrows; i++) {
         const Row& r = rows[i];
         logf("vk:   %c %7.3f ms  %6.1f x  %7.1f us  %8.1f items  %6.2f MB  %s", r.k ? 'u' : 'm', r.a.ns / f / 1e6, r.a.n / f,
              r.a.ns / std::max<int64_t>(r.a.n, 1) / 1e3, r.a.items / f, r.a.bytes / f / mb, r.name.c_str());
