@@ -5351,6 +5351,70 @@ bool fallback_pipelines_ready(Program& p) {
 }
 
 /// The dispatches of a mesh draw, outside any render pass, and the vertex count its graphics draw then covers.
+// (hookshot) RX_VK_FB_STATS=1: what each mesh fallback draw made, from its records' header copied after its dispatches into a
+// ring read back 8 frames later: the mesh workgroups its task started (the mesh dispatch's x) and the vertices drawn (three a
+// primitive). Logged every 300 frames by program: draws, mesh workgroups and vertices a draw
+struct FbStatRing {
+    VkBuffer buf = VK_NULL_HANDLE;
+    VmaAllocation mem = nullptr;
+    uint32_t* map = nullptr;
+    static constexpr uint32_t kN = 8192;
+    uint64_t key[kN]{}, frame[kN]{};
+    uint32_t next = 0, read = 0;
+    struct Agg { int64_t n = 0, groups = 0, verts = 0; };
+    std::map<uint64_t, Agg> agg;
+    int64_t last_log = 0;
+    std::mutex mu;
+};
+FbStatRing& fb_stats() {
+    static FbStatRing r;
+    return r;
+}
+bool fb_stats_on() {
+    static const bool on = getenv("RX_VK_FB_STATS") != nullptr;
+    return on;
+}
+void fb_stats_note(VkCommandBuffer cmd, uint64_t key, VkBuffer records) {
+    FbStatRing& r = fb_stats();
+    std::lock_guard lk(r.mu);
+    if (!r.buf) {
+        void* m = nullptr;
+        if (!create_buffer_cached((uint64_t)FbStatRing::kN * 32, VK_BUFFER_USAGE_TRANSFER_DST_BIT, r.buf, r.mem, &m, false) || !m) return;
+        r.map = (uint32_t*)m;
+    }
+    const uint64_t now = texture_frame_no();
+    while (r.read != r.next && r.frame[r.read % FbStatRing::kN] + 8 <= now) {   // (done on the GPU long since)
+        const uint32_t i = r.read % FbStatRing::kN;
+        invalidate_mapped(r.mem, (uint64_t)FbStatRing::kN * 32);
+        FbStatRing::Agg& a = r.agg[r.key[i]];
+        a.n++, a.verts += r.map[i * 8 + 0], a.groups += r.map[i * 8 + 5];
+        r.read++;
+    }
+    if (r.next - r.read >= FbStatRing::kN) return;   // (full: this one not counted)
+    const uint32_t i = r.next % FbStatRing::kN;
+    r.key[i] = key, r.frame[i] = now, r.next++;
+    const VkBufferCopy c{0, (VkDeviceSize)i * 32, 32};
+    vkCmdCopyBuffer(cmd, records, r.buf, 1, &c);
+    VkMemoryBarrier2 b{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};   // (before the next fallback draw's fills of the header)
+    b.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, b.srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.memoryBarrierCount = 1, di.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cmd, &di);
+    if ((int64_t)now - r.last_log >= 300 && !r.agg.empty()) {
+        r.last_log = (int64_t)now;
+        std::vector<std::pair<uint64_t, FbStatRing::Agg>> v(r.agg.begin(), r.agg.end());
+        std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.second.verts > y.second.verts; });
+        int64_t n = 0;
+        for (const auto& kv : v) n += kv.second.n;
+        logf("vk: fallback stats, %lld draws read back (by program: draws, mesh workgroups a draw, vertices a draw):", (long long)n);
+        for (size_t k = 0; k < v.size() && k < 20; k++)
+            logf("vk:   %016llx %6lld draws %9.1f groups %9.1f vertices", (unsigned long long)v[k].first, (long long)v[k].second.n,
+                 (double)v[k].second.groups / v[k].second.n, (double)v[k].second.verts / v[k].second.n);
+        r.agg.clear();
+    }
+}
+
 bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     if (d.count_addr) {   // (more than one draw in the records: each its own dispatch, not one)
         static std::atomic<int> told{0};
@@ -5438,6 +5502,7 @@ bool fallback_record(VkCommandBuffer cmd, Program& p, const DrawArgs& d) {
     // whatever else the game's mesh program wrote, for every later stage)
     fallback_barrier(cmd, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    if (fb_stats_on()) fb_stats_note(cmd, p.key, f->records);
     return true;
 }
 } // namespace
