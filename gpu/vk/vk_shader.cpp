@@ -1199,6 +1199,19 @@ void disk_init() {
                 }
                 if (scanned) idx_whole = false;
                 for (const auto& [key, d] : order) disk_records[key].push_back(d);
+                // (hookshot, a test: RX_VK_RETRANSLATE=<key prefixes>: those programs translated again, their records here not
+                // read and their new translations not kept, so the file stays as it was. A change to the translation measured
+                // on a few programs without the whole cache made again)
+                if (getenv("RX_VK_RETRANSLATE")) {
+                    size_t dropped = 0;
+                    for (auto it = disk_records.begin(); it != disk_records.end();) {
+                        char hex[24];
+                        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)it->first);
+                        if (key_listed(hex, "RX_VK_RETRANSLATE")) it = disk_records.erase(it), dropped++;
+                        else ++it;
+                    }
+                    logf("vk: program cache: %zu programs translated again (RX_VK_RETRANSLATE)", dropped);
+                }
                 if (idx_n && !idx_whole)
                     logf("vk: program cache index: %zu records from it, %zu more read from the cache", idx_n, scanned);
             }
@@ -1348,6 +1361,11 @@ void get_info(Reader& r, Shader::Info& i) {
 void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t>>& spirv) {
     disk_init();
     if (!disk_on || spirv.size() != p.stages.size()) return;
+    if (getenv("RX_VK_RETRANSLATE")) {   // (hookshot: a test's translations are not kept, above)
+        char hex[24];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)p.key);
+        if (key_listed(hex, "RX_VK_RETRANSLATE")) return;
+    }
     std::vector<uint8_t> o;
     o.reserve(256 << 10);
     put_head(o, p);
