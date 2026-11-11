@@ -6426,6 +6426,10 @@ bool movie_upscale(VkCommandBuffer cmd, uint32_t in_handle, uint32_t out_handle,
 // softer. The gameplay networks are never left out. RX_VK_NETWORK_KEEP=all: never
 std::atomic<bool> movie_networks_slow{false};
 bool gameplay_network(uint64_t key) { return key == 0xfd029a317a9a4b94ull || key == 0x9dc98871eb7fc101ull; }
+/// (hookshot) the game's upscale networks of the fixed shares of the Render resolution row (dlss_stand_in): 67, 58, 50, 33%
+bool share_network(uint64_t key) {
+    return key == 0x6676619641320ba7ull || key == 0xf10782f9e58b6a7cull || key == 0x72ba090c70fe2614ull || key == 0x0775215f8da720e6ull;
+}
 
 static movie_upscale_policy::Mode movie_upscale_mode() {
     // Read on first dispatch, after host/hos_main.c has loaded hookshot_env.txt.
@@ -6441,6 +6445,10 @@ static bool movie_keep_all_networks() {
 static bool typed_upscale(VkCommandBuffer cmd, VkImageView input_view, VkImageView output_view,
                           Texture* out, uint32_t level, uint64_t key, const char* keys, bool temporal);
 
+static bool share_fxaa_on() {
+    static const bool on = !getenv("RX_VK_SHARE_FXAA") || atoi(getenv("RX_VK_SHARE_FXAA")) != 0;
+    return on;
+}
 bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
     static const bool off = getenv("RX_VK_NO_UPSCALE_STUB") != nullptr;
     if (off) return false;
@@ -6524,7 +6532,10 @@ bool upscale_stub(VkCommandBuffer cmd, const NvnState& s, uint64_t key) {
             const VkImageView output_view = texture_view(dst, &out, nullptr, VK_IMAGE_VIEW_TYPE_2D, ViewUse::Storage,
                                                          &output_format, VK_FORMAT_B10G11R11_UFLOAT_PACK32);
             if (input_format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 && output_format == VK_FORMAT_B10G11R11_UFLOAT_PACK32 &&
-                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", false)) {
+                // (hookshot) a fixed share's network, the scene's upscale where no network runs: with the gameplay stand-in's
+                // FXAA (the taau_upscale shader's edges pass), as 75% and Auto have through fd029a31's stand-in. It was a bare
+                // linear upscale, the edges stair-stepped at 768x432 on a 1536x864 picture. RX_VK_SHARE_FXAA=0: as before
+                typed_upscale(cmd, input_view, output_view, dst, 0, key, "generic RGB9E5 fallback", share_fxaa_on() && share_network(key))) {
                 full_barrier(cmd);
                 texture_written(dst);
                 return true;
